@@ -9,8 +9,8 @@ from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 
 # Load API key from .env file
-load_dotenv()
-OpenAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OpenAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+
 
 st.header("NoteBot")
 
