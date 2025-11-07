@@ -1,159 +1,150 @@
+"""
+NoteBot — Streamlit + LangChain (single file)
+-------------------------------------------------
+Quick start:
+1) Install deps (one-time):
+   pip install -U streamlit PyPDF2 langchain langchain-openai langchain-community langchain-text-splitters faiss-cpu
+
+2) Set your OpenAI API key (any one of these):
+   - In shell:  export OPENAI_API_KEY="sk-..."   (Windows PowerShell:  $env:OPENAI_API_KEY="sk-...")
+   - In .streamlit/secrets.toml:  OPENAI_API_KEY = "sk-..."
+   - Or type it into the sidebar field when the app runs.
+
+3) Run the app:
+   streamlit run app.py
+"""
+
 import io
 import os
+import hashlib
 import streamlit as st
 from PyPDF2 import PdfReader
 
-from langchain.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
 
-# -----------------------------
-# App Title
-# -----------------------------
-st.set_page_config(page_title="NoteBot", page_icon="📝")
-st.header("📝 NoteBot")
+# -------------------------------
+# Page config
+# -------------------------------
+st.set_page_config(page_title="NoteBot", page_icon="📓", layout="wide")
+st.title("📓 NoteBot")
 
-# -----------------------------
-# Secrets / API key
-# -----------------------------
-try:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-except Exception:
-    st.stop()  # Fail early so we don't proceed without a key
-
-# -----------------------------
-# Sidebar: Upload & Build Index
-# -----------------------------
-with st.sidebar:
-    st.title("My Notes")
-    file = st.file_uploader("Upload notes PDF and start asking questions", type="pdf")
-    build_btn = st.button("Build / Rebuild Index", disabled=(file is None))
-    st.caption("Tip: Rebuild the index if you upload a new file.")
-
-# -----------------------------
+# -------------------------------
 # Helpers
-# -----------------------------
-def extract_pdf_text(uploaded_file) -> str:
-    """Extract text from a Streamlit uploaded PDF file."""
-    # Streamlit gives a BytesIO-like object; ensure PyPDF2 gets bytes
-    pdf_bytes = uploaded_file.read()
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text_chunks = []
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        text_chunks.append(page_text)
-    return "\n".join(text_chunks)
+# -------------------------------
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # change if needed
 
-def build_vectorstore_from_text(text: str) -> FAISS:
+def get_api_key() -> str | None:
+    # Priority: Streamlit secrets -> ENV -> user input
+    key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    key = key or os.getenv("OPENAI_API_KEY")
+    if not key:
+        with st.sidebar:
+            st.info("Add your OpenAI API key to continue.")
+            key = st.text_input("OpenAI API key", type="password")
+    return key
+
+@st.cache_resource(show_spinner=False)
+def build_vector_store(pdf_bytes: bytes, api_key: str) -> FAISS:
+    """Reads PDF bytes, extracts text by page, splits into chunks, and returns a FAISS store."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+
+    # Extract per-page text and preserve page numbers in metadata
+    page_docs: list[Document] = []
+    for idx, page in enumerate(reader.pages):
+        raw = page.extract_text() or ""
+        if raw.strip():
+            page_docs.append(Document(page_content=raw, metadata={"page": idx + 1}))
+
+    if not page_docs:
+        raise ValueError("No extractable text found in the PDF. Try another file.")
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=300,
         chunk_overlap=50,
-        length_function=len
+        length_function=len,
     )
-    chunks = splitter.split_text(text)
-    if not chunks:
-        raise ValueError("No text chunks were created from the PDF. Check the PDF content.")
-    embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-    return FAISS.from_texts(chunks, embeddings)
+    chunked_docs = splitter.split_documents(page_docs)
 
-def get_llm():
-    return ChatOpenAI(
-        api_key=OPENAI_API_KEY,
-        model="gpt-3.5-turbo",
-        temperature=0,
-        max_tokens=300,
-    )
+    embeddings = OpenAIEmbeddings(api_key=api_key)
+    store = FAISS.from_documents(chunked_docs, embeddings)
+    return store
 
-# -----------------------------
-# Build vector store when asked
-# -----------------------------
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-if "file_name" not in st.session_state:
-    st.session_state.file_name = None
+# -------------------------------
+# Sidebar: file upload
+# -------------------------------
+with st.sidebar:
+    st.header("My Notes")
+    uploaded = st.file_uploader("Upload a PDF and start asking questions", type=["pdf"]) 
 
-if build_btn and file is not None:
-    with st.spinner("Reading PDF and building vector index..."):
-        try:
-            text = extract_pdf_text(file)
-            vector_store = build_vectorstore_from_text(text)
-            st.session_state.vector_store = vector_store
-            st.session_state.file_name = file.name
-            st.success(f"Index built from: {file.name}")
-        except Exception as e:
-            st.error(f"Failed to build index: {e}")
+api_key = get_api_key()
+if not api_key:
+    st.stop()
 
-# -----------------------------
-# Chat UI
-# -----------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# -------------------------------
+# Load / cache vector store for the uploaded file
+# -------------------------------
+if uploaded is not None:
+    pdf_bytes = uploaded.getvalue()
+    # Build a stable cache key for this exact file content
+    cache_key = hashlib.md5(pdf_bytes).hexdigest()
 
-# Show prior messages
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+    try:
+        with st.spinner("Indexing your notes (embeddings + FAISS)..."):
+            vector_store = build_vector_store(pdf_bytes, api_key)
+        st.success("Notes are ready. Ask a question below! ✅")
+    except Exception as e:
+        st.error(f"Failed to process PDF: {e}")
+        st.stop()
 
-user_query = st.chat_input("Ask a question about your notes...")
-if user_query:
-    # Show user message immediately
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.markdown(user_query)
+    # -------------------------------
+    # Query UI
+    # -------------------------------
+    user_query = st.text_input("Type your question about the PDF", placeholder="e.g., Summarize section 2, or What does theorem 3 state?")
 
-    if st.session_state.vector_store is None:
-        with st.chat_message("assistant"):
-            st.warning("Please upload a PDF and click **Build / Rebuild Index** first.")
-    else:
-        # Retrieve relevant chunks
-        try:
-            matching_chunks = st.session_state.vector_store.similarity_search(user_query, k=4)
-        except Exception as e:
-            with st.chat_message("assistant"):
-                st.error(f"Similarity search failed: {e}")
-            st.stop()
+    if user_query:
+        # Retrieve similar chunks
+        with st.spinner("Searching relevant chunks..."):
+            matching_chunks = vector_store.similarity_search(user_query, k=4)
 
         # Define LLM and prompt
-        llm = get_llm()
-        prompt = ChatPromptTemplate.from_template(
-            """You are my assistant tutor. Answer the question based on the following context.
-If you do not find the answer in the context, reply exactly with: "I don't know Jenny".
-
-<context>
-{context}
-</context>
-
-Question: {input}"""
+        llm = ChatOpenAI(
+            api_key=api_key,
+            model=MODEL_NAME,
+            temperature=0,
+            max_tokens=300,
         )
+        prompt = ChatPromptTemplate.from_template(
+            (
+                "You are a helpful tutor. Answer the user's question using ONLY the provided context.\n"
+                "If the answer cannot be found in the context, reply exactly with: I don't know Jenny\n\n"
+                "Context:\n{context}\n\n"
+                "Question: {input}"
+            )
+        )
+        chain = create_stuff_documents_chain(llm, prompt)
 
-        # Create the chain that stuffs the retrieved docs into {context}
-        chain = create_stuff_documents_chain(llm, prompt=prompt)
+        with st.spinner("Thinking..."):
+            result = chain.invoke({"input": user_query, "input_documents": matching_chunks})
 
-        # Run the chain
-        try:
-            output = chain.invoke({
-                "context": matching_chunks,  # list[Document]
-                "input": user_query          # user question
-            })
-        except Exception as e:
-            with st.chat_message("assistant"):
-                st.error(f"LLM chain failed: {e}")
-            st.stop()
+        # The chain commonly returns a string, but handle dict just in case
+        if isinstance(result, dict):
+            answer_text = result.get("output", result.get("answer", str(result)))
+        else:
+            answer_text = str(result)
 
-        # Display assistant answer
-        with st.chat_message("assistant"):
-            # chain.invoke can return a string or an AIMessage depending on LC version
-            response_text = getattr(output, "content", output)
-            st.markdown(response_text)
+        st.subheader("Answer")
+        st.markdown(answer_text)
 
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
-
-# -----------------------------
-# Footer info
-# -----------------------------
-st.caption(
-    "Notes are embedded locally in-memory using FAISS. "
-    "Re-run the index if you upload a new PDF."
-)
+        # Show sources (pages) used
+        with st.expander("Show context excerpts (sources)"):
+            for i, d in enumerate(matching_chunks, start=1):
+                p = d.metadata.get("page", "?")
+                snippet = d.page_content.strip().replace("\n", " ")
+                st.markdown(f"**Chunk {i} — Page {p}:**\n\n{snippet[:600]}{'…' if len(snippet) > 600 else ''}")
+else:
+    st.info("Upload a PDF from the sidebar to begin.")
